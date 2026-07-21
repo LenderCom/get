@@ -1,0 +1,118 @@
+#!/bin/sh
+# saw-agent installer — https://github.com/LenderCom/get
+#
+# Usage:  curl -fsSL https://lendercom.github.io/get/agent | sh
+#
+# Installs the prebuilt saw-agent binary (macOS/Linux, amd64/arm64) from the
+# public release on https://github.com/LenderCom/homebrew-tap. The version is
+# pinned (deterministic install, no GitHub API calls, no rate limits) and the
+# download is checksum-verified against the release's SHA256SUMS.
+#
+# Options (environment variables):
+#   SAW_AGENT_VERSION   override the version to install (default below)
+#   SAW_INSTALL_DIR     override the install directory
+#
+# Everything is wrapped in main() and the final line invokes it, so a
+# truncated download dies parsing instead of executing half a script.
+
+set -eu
+
+SAW_AGENT_VERSION="${SAW_AGENT_VERSION:-v0.1.0}"
+RELEASE_BASE="https://github.com/LenderCom/homebrew-tap/releases/download/saw-agent-${SAW_AGENT_VERSION}"
+
+say() { printf '%s\n' "$*"; }
+fail() { printf 'saw-agent install: %s\n' "$*" >&2; exit 1; }
+
+detect_platform() {
+  os="$(uname -s)"
+  case "$os" in
+    Darwin) os=darwin ;;
+    Linux) os=linux ;;
+    *) fail "unsupported OS '$os' (macOS and Linux only; on macOS you can also 'brew install lendercom/tap/saw-agent')" ;;
+  esac
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64 | amd64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) fail "unsupported architecture '$arch' (amd64 and arm64 only)" ;;
+  esac
+  PLATFORM="${os}_${arch}"
+}
+
+# sha256sum is absent on stock macOS, shasum on minimal Linux — detect, and
+# refuse to install unverified if neither exists.
+verify_checksum() {
+  file="$1"
+  sums="$2"
+  expected="$(grep " $(basename "$file")\$" "$sums" | awk '{print $1}')"
+  [ -n "$expected" ] || fail "no checksum for $(basename "$file") in SHA256SUMS"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    fail "neither sha256sum nor shasum found — cannot verify the download"
+  fi
+  [ "$actual" = "$expected" ] || fail "checksum mismatch for $(basename "$file") (expected $expected, got $actual)"
+}
+
+pick_install_dir() {
+  if [ -n "${SAW_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$SAW_INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
+  elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+    INSTALL_DIR=/usr/local/bin
+  else
+    # No sudo here on purpose: under `curl | sh`, sudo's password prompt would
+    # read the pipe and eat the rest of the script.
+    INSTALL_DIR="$HOME/.local/bin"
+    mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
+  fi
+}
+
+main() {
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v tar >/dev/null 2>&1 || fail "tar is required"
+
+  detect_platform
+  asset="saw-agent_${SAW_AGENT_VERSION}_${PLATFORM}.tar.gz"
+
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/saw-agent-install.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT
+
+  say "Downloading saw-agent ${SAW_AGENT_VERSION} (${PLATFORM})..."
+  curl -fsSL --proto '=https' -o "$tmp/$asset" "$RELEASE_BASE/$asset" ||
+    fail "download failed: $RELEASE_BASE/$asset"
+  curl -fsSL --proto '=https' -o "$tmp/SHA256SUMS" "$RELEASE_BASE/SHA256SUMS" ||
+    fail "download failed: $RELEASE_BASE/SHA256SUMS"
+  verify_checksum "$tmp/$asset" "$tmp/SHA256SUMS"
+
+  tar -xzf "$tmp/$asset" -C "$tmp" saw-agent
+  [ -f "$tmp/saw-agent" ] || fail "archive did not contain a saw-agent binary"
+  chmod 0755 "$tmp/saw-agent"
+
+  pick_install_dir
+  # Copy to a temp name in the target dir, then atomic mv — replacing an
+  # in-use binary in place would fail with ETXTBSY on Linux.
+  cp "$tmp/saw-agent" "$INSTALL_DIR/.saw-agent.new" || fail "cannot write to $INSTALL_DIR"
+  mv "$INSTALL_DIR/.saw-agent.new" "$INSTALL_DIR/saw-agent"
+
+  say "Installed: $INSTALL_DIR/saw-agent"
+  "$INSTALL_DIR/saw-agent" --version || true
+
+  resolved="$(command -v saw-agent 2>/dev/null || true)"
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*)
+      if [ -n "$resolved" ] && [ "$resolved" != "$INSTALL_DIR/saw-agent" ]; then
+        say "Note: 'saw-agent' currently resolves to $resolved (another install shadows this one)."
+      fi
+      ;;
+    *)
+      say ""
+      say "$INSTALL_DIR is not on your PATH. Add it:"
+      say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+      ;;
+  esac
+}
+
+main "$@"

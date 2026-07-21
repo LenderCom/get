@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LenderCom installers</title>
+    <style>
+      body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 720px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+      pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+      a { color: #0b57d0; }
+    </style>
+  </head>
+  <body>
+    <h1>LenderCom installers</h1>
+    <p><strong>saw-agent</strong> — the SAW remote agent (macOS / Linux, amd64 / arm64):</p>
+    <pre>curl -fsSL https://lendercom.github.io/get/agent | sh</pre>
+    <p>macOS via Homebrew:</p>
+    <pre>brew install lendercom/tap/saw-agent</pre>
+    <p>
+      Binaries are published as release assets on
+      <a href="https://github.com/LenderCom/homebrew-tap/releases">LenderCom/homebrew-tap</a>;
+      the install script checksum-verifies every download. Script source:
+      <a href="https://github.com/LenderCom/get">LenderCom/get</a>.
+    </p>
+  </body>
+</html>
