@@ -1,7 +1,7 @@
 #!/bin/sh
 # saw-agent installer — https://github.com/LenderCom/get
 #
-# Usage:  curl -fsSL https://lendercom.github.io/get/agent | sh
+# Usage:  curl -fsSL https://get.sawrun.com/agent | sh
 #
 # Installs the prebuilt saw-agent binary (macOS/Linux, amd64/arm64) from the
 # public release on https://github.com/LenderCom/homebrew-tap. The version is

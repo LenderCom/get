@@ -1,11 +1,11 @@
 # get — LenderCom install scripts
 
-Served via GitHub Pages at **https://lendercom.github.io/get/**.
+Served via GitHub Pages at **https://get.sawrun.com/**.
 
 ## saw-agent
 
 ```sh
-curl -fsSL https://lendercom.github.io/get/agent | sh
+curl -fsSL https://get.sawrun.com/agent | sh
 ```
 
 macOS users can also `brew install lendercom/tap/saw-agent`
@@ -34,17 +34,17 @@ When a new saw-agent version ships (see
 [homebrew-tap/RELEASING.md](https://github.com/LenderCom/homebrew-tap/blob/main/RELEASING.md)),
 bump `SAW_AGENT_VERSION` in [`agent`](agent).
 
-## Follow-up: branded domain
+## Branded domain
 
-The SAW infrastructure domain is `sawrun.com` (owner decision 2026-07-17; DNS on
-Cloudflare — the original `get.saw.dev` string shipped in the UI referenced a
-domain LenderCom does not own). To serve this site as `https://get.sawrun.com/agent`:
+Served as `https://get.sawrun.com/` — `sawrun.com` is the SAW infrastructure
+domain (owner decision 2026-07-17; the original `get.saw.dev` string shipped in
+the UI referenced a domain LenderCom does not own). Wiring (live since
+2026-07-21, DEV-5921):
 
-1. Cloudflare (sawrun.com zone): `CNAME get -> lendercom.github.io.` (DNS-only /
-   unproxied, so GitHub Pages can issue the certificate).
-2. This repo → Settings → Pages → Custom domain: `get.sawrun.com` (creates the
-   `CNAME` file), wait for the cert, enable "Enforce HTTPS".
-3. Update the install command in `saw-ui`
-   (`src/features/remote-agents/PairingGuide/PairingGuide.tsx`) and this README
-   to the new URL. The old `lendercom.github.io/get/...` URL keeps working (GitHub
-   redirects project pages to the custom domain).
+- Cloudflare (sawrun.com zone): unproxied `CNAME get -> lendercom.github.io`
+  (unproxied so GitHub Pages could issue/renew the certificate); codified in
+  `saw-infrastructure` (`environments/dev/main.get-install.tf`).
+- This repo's GitHub Pages custom domain: `get.sawrun.com` (the committed
+  `CNAME` file), HTTPS enforced.
+- The old `https://lendercom.github.io/get/...` URLs keep working — GitHub
+  301-redirects project pages to the custom domain.
