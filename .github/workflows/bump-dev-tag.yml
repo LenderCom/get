@@ -1,0 +1,68 @@
+name: Bump agent installer dev tag
+
+# Keeps the `agent` installer's pinned SAW_AGENT_TAG_DEV default current against
+# LenderCom/saw-agent-releases, which cuts dev pre-releases several times a day. Nothing
+# dispatches this repo on publish yet (same unwired-sender gap as homebrew-tap's
+# bump-formula*.yml), so this polls on a schedule; workflow_dispatch covers a manual bump
+# and a future repository_dispatch can be added once the sending side exists.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag on LenderCom/saw-agent-releases, e.g. dev-v0.2.0-dev.5 (default: latest pre-release)"
+        required: false
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: bump-agent-dev-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release list --repo LenderCom/saw-agent-releases \
+              --json tagName,isPrerelease,isDraft \
+              --jq '[.[] | select(.isPrerelease and (.isDraft | not))][0].tagName // empty')
+          fi
+          if [ -z "$tag" ]; then
+            echo "no dev pre-release tag found on LenderCom/saw-agent-releases (and none given)" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Bump pinned default tag
+        run: script/bump-dev-tag.sh "${{ steps.tag.outputs.tag }}"
+
+      - name: Verify
+        run: |
+          sh -n agent
+          command -v shellcheck >/dev/null 2>&1 && shellcheck -s sh agent || true
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: bump agent installer dev tag to ${{ steps.tag.outputs.tag }}"
+          # Fixed branch: dev cuts several releases a day, so each poll updates the SAME
+          # open PR in place instead of piling up one PR per build (mirrors
+          # homebrew-tap's bump-formula-dev.yml).
+          branch: bump-agent-dev-tag
+          title: "chore: bump agent installer dev tag to ${{ steps.tag.outputs.tag }}"
+          body: |
+            Automated bump of the `agent` installer's pinned `SAW_AGENT_TAG_DEV` default to
+            `LenderCom/saw-agent-releases@${{ steps.tag.outputs.tag }}`. Nothing else changed.
+            This PR is force-updated in place on every new dev-channel build until merged.

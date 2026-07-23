@@ -58,8 +58,19 @@ saw-agent releases are published to
 (dev channel: prerelease tags off `main`; stable channel: `v*` tags) — see
 `plan/saw-agent-auto-update-plan.md` §2.7 in `LenderCom/saw-docs`. The pinned
 tag constants in [`agent`](agent) (`SAW_AGENT_TAG_DEV` / `SAW_AGENT_TAG_STABLE`)
-are bumped by the release pipeline's automated formula/get-bump step once it
-lands; until then, bump them by hand alongside a release.
+used to only be bumped by hand alongside a release; [`bump-dev-tag.yml`](.github/workflows/bump-dev-tag.yml)
+now keeps `SAW_AGENT_TAG_DEV` current automatically (`script/bump-dev-tag.sh`, polling
+`saw-agent-releases` on a schedule until that repo dispatches this one directly).
+
+**`SAW_AGENT_TAG_STABLE` has no equivalent yet and is currently BROKEN** — its default
+(`v0.1.0`) does not exist on `saw-agent-releases` (no stable tag has been published there;
+the real `v0.1.0` binaries live on `LenderCom/homebrew-tap`'s own release, a different
+repo/tag), so `curl -fsSL https://get.sawrun.com/agent | sh` (channel defaults to `stable`)
+404s on a real install today. Fixing it needs either an initial stable tag cut on
+`saw-agent-releases` (with the real minisign stable-channel signing key this repo doesn't
+have — public key only, by design), or a decision to repoint the stable fetch at
+`homebrew-tap`'s release until one exists. Flagged, not fixed, in the PR that added
+`bump-dev-tag.yml` — this needs an org/release-process call, not a script change.
 
 ## Branded domain
 

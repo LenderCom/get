@@ -47,7 +47,7 @@ SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST0000
 # prereleases like `dev-v0.2.0-dev.31`; stable tags are plain `vX.Y.Z`).
 # Bumped by the automated formula/get-bump wiring (plan §2.7/2.11 Phase 1);
 # until that lands and the releases repo exists, these are placeholders.
-SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.0-dev.0}"
+SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.1-dev.21}"
 SAW_AGENT_TAG_STABLE="${SAW_AGENT_TAG_STABLE:-v0.1.0}"
 
 RELEASES_REPO="LenderCom/saw-agent-releases"
@@ -387,6 +387,65 @@ install_service_unit() {
   esac
 }
 
+# --- post-install guidance: a successful install (and even the service unit
+# above) only brings up the LOCAL broker — it has nothing to say about pairing
+# with a SAW cloud workspace, which is a separate, deliberate step. Print the
+# same real next-steps the Homebrew formula's caveats show (LenderCom/homebrew-tap
+# Formula/saw-agent.rb / saw-agent-dev.rb) so a curl-installed machine isn't any
+# more stranded than a brew-installed one. Base cloud origins are channel-scoped:
+# the compiled agent has no built-in default for any of them (verified against
+# LenderCom/saw-agent's internal/cloud/config.go), so print the real ones rather
+# than tell the user to guess.
+print_pairing_next_steps() {
+  channel="$1"
+  case "$channel" in
+    dev)
+      agents_url="https://agents.dev.sawrun.com"
+      accounts_url="https://accounts.dev.sawrun.com"
+      realtime_url="https://realtime.dev.sawrun.com"
+      workspace_url="https://workspace.dev.sawrun.com"
+      ;;
+    *)
+      agents_url="https://agents.sawrun.com"
+      accounts_url="https://accounts.sawrun.com"
+      realtime_url="https://realtime.sawrun.com"
+      workspace_url="https://workspace.sawrun.com"
+      ;;
+  esac
+  say ""
+  say "Next: pair this machine with a SAW cloud workspace"
+  say "===================================================="
+  say ""
+  say "1. Easiest -- in the browser, open your SAW workspace, go to Agents, and click"
+  say "   \"Add remote agent\". The wizard mints a one-time pair code and hands you the"
+  say "   exact command, already filled in."
+  say ""
+  say "2. Direct -- a workspace operator mints a code (\`saw machines pair-code\`, or the"
+  say "   same wizard):"
+  say ""
+  say "     SAW_CLOUD_ORG=<org-id> \\"
+  say "       SAW_CLOUD_PAIR_CODE=<code> \\"
+  say "       saw-agent --cloud"
+  say ""
+  say "3. Self-pair your OWN signed-in machine -- no code needed:"
+  say ""
+  say "     SAW_CLOUD_SELF_PAIR=1 SAW_CLOUD_ORG=<org-id> saw-agent --cloud"
+  say ""
+  say "   (needs SAW_CLOUD_USER_TOKEN -- a signed-in user session bearer)"
+  say ""
+  say "Every cloud attach also needs these set once (channel: $channel, no built-in default):"
+  say ""
+  say "  SAW_CLOUD_AGENTS_URL=$agents_url"
+  say "  SAW_CLOUD_ACCOUNTS_URL=$accounts_url"
+  say "  SAW_CLOUD_REALTIME_URL=$realtime_url"
+  say "  SAW_CLOUD_WORKSPACE_URL=$workspace_url"
+  say ""
+  say "The service unit just installed only keeps the LOCAL broker running -- it does not"
+  say "attach to the cloud by itself. Run saw-agent by hand with the flags above once"
+  say "you're ready to pair; the running daemon is what adopts \`saw-agent self-update\`"
+  say "from there on."
+}
+
 # --- the real install path ---
 do_install() {
   detect_platform
@@ -458,6 +517,8 @@ do_install() {
       say "  export PATH=\"$install_dir:\$PATH\""
       ;;
   esac
+
+  print_pairing_next_steps "$CHANNEL"
 }
 
 # --- --dry-run: a self-test against a throwaway fixture release, exercising
