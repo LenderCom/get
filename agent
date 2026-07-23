@@ -1,34 +1,108 @@
 #!/bin/sh
 # saw-agent installer — https://github.com/LenderCom/get
 #
-# Usage:  curl -fsSL https://get.sawrun.com/agent | sh
+# Usage:  curl -fsSL https://get.sawrun.com/agent | sh -s -- --channel dev
 #
 # Installs the prebuilt saw-agent binary (macOS/Linux, amd64/arm64) from the
-# public release on https://github.com/LenderCom/homebrew-tap. The version is
-# pinned (deterministic install, no GitHub API calls, no rate limits) and the
-# download is checksum-verified against the release's SHA256SUMS.
+# public releases on https://github.com/LenderCom/saw-agent-releases, verifies
+# it, installs it to ~/.saw/bin/saw-agent, and registers a launchd (macOS) /
+# systemd --user (Linux) unit that keeps it running.
 #
-# Options (environment variables):
-#   SAW_AGENT_VERSION   override the version to install (default below)
-#   SAW_INSTALL_DIR     override the install directory
+# Verification is two-layer: the release's signed manifest.json is checked
+# against the embedded minisign public key(s) BEFORE anything in it is
+# trusted, then the downloaded artifact's sha256 is checked against the
+# manifest's own (signed) per-artifact hash — see verify_manifest_signature /
+# verify_artifact_checksum below for why the manifest's hash is authoritative
+# over the unsigned SHA256SUMS file.
+#
+# Options:
+#   --channel dev|stable   release channel to track (default: stable)
+#   --dry-run              run the full install flow against a throwaway,
+#                          self-signed fixture instead of the real network
+#                          and system paths — a self-test, not a real install
+#
+# Environment variables:
+#   SAW_CLOUD_CHANNEL   same as --channel; --channel wins if both are given
+#   SAW_AGENT_TAG_DEV / SAW_AGENT_TAG_STABLE   override the pinned release tag
+#   SAW_INSTALL_DIR     override ~/.saw/bin
+#   SAW_SKIP_SERVICE    set to skip installing the launchd/systemd unit
 #
 # Everything is wrapped in main() and the final line invokes it, so a
 # truncated download dies parsing instead of executing half a script.
 
 set -eu
 
-SAW_AGENT_VERSION="${SAW_AGENT_VERSION:-v0.1.0}"
-RELEASE_BASE="https://github.com/LenderCom/homebrew-tap/releases/download/saw-agent-${SAW_AGENT_VERSION}"
+# --- placeholders, replace at T0 (org-admin key provisioning, plan §2.7) ---
+# These are NOT real minisign keys. LenderCom/saw-agent-releases, its signing
+# keypairs, and the release pipeline do not exist yet (tracked as a blocker
+# on this ticket) — until they do, every real install fails closed at
+# signature verification, by design: an installer that "verifies" against a
+# placeholder key would be worse than one that refuses to run.
+SAW_MINISIGN_PUBKEY_DEV_CURRENT="RWTPLACEHOLDERDEVCURRENTKEYDONOTTRUST0000000000000000000000"
+SAW_MINISIGN_PUBKEY_DEV_STANDBY="RWTPLACEHOLDERDEVSTANDBYKEYDONOTTRUST0000000000000000000000"
+SAW_MINISIGN_PUBKEY_STABLE_CURRENT="RWTPLACEHOLDERSTABLECURRENTKEYDONOTTRUST000000000000000000"
+SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST000000000000000000"
+
+# Pinned release tags per channel (plan §2.1: dev tags are metadata-stripped
+# prereleases like `dev-v0.2.0-dev.31`; stable tags are plain `vX.Y.Z`).
+# Bumped by the automated formula/get-bump wiring (plan §2.7/2.11 Phase 1);
+# until that lands and the releases repo exists, these are placeholders.
+SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.0-dev.0}"
+SAW_AGENT_TAG_STABLE="${SAW_AGENT_TAG_STABLE:-v0.1.0}"
+
+RELEASES_REPO="LenderCom/saw-agent-releases"
+RELEASES_HOST="https://github.com"
+
+INSTALLER_TEMPLATE_VERSION=1 # bump when the unit template shape changes
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'saw-agent install: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+Usage: agent [--channel dev|stable] [--dry-run]
+EOF
+}
+
+# --- args / channel resolution: --channel > SAW_CLOUD_CHANNEL > stable ---
+CHANNEL="${SAW_CLOUD_CHANNEL:-stable}"
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --channel)
+      [ $# -ge 2 ] || fail "--channel requires an argument (dev or stable)"
+      CHANNEL="$2"
+      shift 2
+      ;;
+    --channel=*)
+      CHANNEL="${1#--channel=}"
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "unrecognized argument '$1' (see --help)"
+      ;;
+  esac
+done
+case "$CHANNEL" in
+  dev | stable) ;;
+  *) fail "--channel must be 'dev' or 'stable', got '$CHANNEL'" ;;
+esac
 
 detect_platform() {
   os="$(uname -s)"
   case "$os" in
     Darwin) os=darwin ;;
     Linux) os=linux ;;
-    *) fail "unsupported OS '$os' (macOS and Linux only; on macOS you can also 'brew install lendercom/tap/saw-agent')" ;;
+    *) fail "unsupported OS '$os' (macOS and Linux only)" ;;
   esac
   arch="$(uname -m)"
   case "$arch" in
@@ -36,83 +110,503 @@ detect_platform() {
     aarch64 | arm64) arch=arm64 ;;
     *) fail "unsupported architecture '$arch' (amd64 and arm64 only)" ;;
   esac
-  PLATFORM="${os}_${arch}"
+  PLATFORM_OS="$os"
+  PLATFORM_ARCH="$arch"
 }
 
-# sha256sum is absent on stock macOS, shasum on minimal Linux — detect, and
-# refuse to install unverified if neither exists.
-verify_checksum() {
-  file="$1"
-  sums="$2"
-  expected="$(grep " $(basename "$file")\$" "$sums" | awk '{print $1}')"
-  [ -n "$expected" ] || fail "no checksum for $(basename "$file") in SHA256SUMS"
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$file" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+sha256_of() {
+  if have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
   else
     fail "neither sha256sum nor shasum found — cannot verify the download"
   fi
-  [ "$actual" = "$expected" ] || fail "checksum mismatch for $(basename "$file") (expected $expected, got $actual)"
 }
 
-pick_install_dir() {
-  if [ -n "${SAW_INSTALL_DIR:-}" ]; then
-    INSTALL_DIR="$SAW_INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
-  elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
-    INSTALL_DIR=/usr/local/bin
+# --- manifest JSON access: jq when present, a small grep/sed fallback when
+# not (real installs cannot assume jq is installed on a bare macOS or a
+# minimal Linux box). Safe because we control the manifest generator's flat
+# schema (plan §2.2): no nested objects/arrays besides "artifacts", whose
+# entries are themselves flat.
+json_scalar() {
+  file="$1"
+  key="$2"
+  if have jq; then
+    jq -r --arg k "$key" 'if has($k) and .[$k] != null then .[$k] else "" end' "$file"
+    return 0
+  fi
+  s1=$(grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" 2>/dev/null | head -n1 \
+    | sed -E "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"/\1/") || true
+  if [ -n "$s1" ]; then
+    printf '%s\n' "$s1"
+    return 0
+  fi
+  grep -o "\"$key\"[[:space:]]*:[[:space:]]*[^,}[:space:]]*" "$file" | head -n1 \
+    | sed -E "s/.*\"$key\"[[:space:]]*:[[:space:]]*//"
+}
+
+manifest_artifact_field() {
+  file="$1"
+  wantos="$2"
+  wantarch="$3"
+  field="$4"
+  if have jq; then
+    jq -r --arg os "$wantos" --arg arch "$wantarch" --arg f "$field" \
+      '.artifacts[] | select(.os == $os and .arch == $arch) | .[$f] // empty' "$file" | head -n1
+    return 0
+  fi
+  collapsed=$(tr -d '\n\r\t ' < "$file")
+  arr=${collapsed#*\"artifacts\":[}
+  arr=${arr%%]*}
+  old_ifs=$IFS
+  IFS='}'
+  found=""
+  for obj in $arr; do
+    obj="${obj#,}"
+    obj="${obj#\{}"
+    obj="$obj}"
+    case "$obj" in
+      *"\"os\":\"$wantos\""*"\"arch\":\"$wantarch\""*) found="$obj" ;;
+    esac
+    [ -n "$found" ] && break
+  done
+  IFS="$old_ifs"
+  [ -n "$found" ] || return 1
+  printf '%s' "$found" | grep -o "\"$field\":\"[^\"]*\"" | head -n1 \
+    | sed -E "s/\"$field\":\"([^\"]*)\"/\1/"
+}
+
+# --- signature verification ---
+# Tries every embedded key for the channel (current + standby, plan §2.7's
+# key SET) in turn; the first one minisign accepts wins. minisign itself
+# rejects a signature whose key id doesn't match the supplied public key, so
+# trying keys in sequence is safe -- there is no partial/ambiguous trust.
+channel_pubkeys() {
+  case "$1" in
+    dev) printf '%s\n%s\n' "$SAW_MINISIGN_PUBKEY_DEV_CURRENT" "$SAW_MINISIGN_PUBKEY_DEV_STANDBY" ;;
+    stable) printf '%s\n%s\n' "$SAW_MINISIGN_PUBKEY_STABLE_CURRENT" "$SAW_MINISIGN_PUBKEY_STABLE_STANDBY" ;;
+  esac
+}
+
+verify_manifest_signature() {
+  manifest="$1"
+  sig="$2"
+  channel="$3"
+  have minisign || fail "minisign is required to verify the release manifest — install it first (macOS: brew install minisign; Linux: apt/dnf/pacman install minisign) and re-run"
+  ok=1
+  for pk in $(channel_pubkeys "$channel"); do
+    if minisign -Vq -m "$manifest" -x "$sig" -P "$pk" >/dev/null 2>&1; then
+      ok=0
+      break
+    fi
+  done
+  [ "$ok" -eq 0 ] || fail "manifest signature verification FAILED for channel '$channel' — refusing to install (release may be tampered, or the embedded key set is stale; see 'saw-agent self-update' docs)"
+}
+
+# --- download ---
+fetch() {
+  url="$1"
+  out="$2"
+  curl -fsSL --proto '=https' -o "$out" "$url" || fail "download failed: $url"
+}
+
+release_tag() {
+  case "$1" in
+    dev) printf '%s' "$SAW_AGENT_TAG_DEV" ;;
+    stable) printf '%s' "$SAW_AGENT_TAG_STABLE" ;;
+  esac
+}
+
+release_url() {
+  # $1 tag, $2 asset name
+  printf '%s/%s/releases/download/%s/%s' "$RELEASES_HOST" "$RELEASES_REPO" "$1" "$2"
+}
+
+# --- host exclusivity (advisory at install time; the agent's own runtime
+# flock + liveness probe is the actual enforcement mechanism, plan §2.6 —
+# "pure standalone has NO spawn-time adjudicator"). We only warn here so a
+# normal reinstall-then-restart flow (the common case) isn't blocked; a
+# cautious operator can force a hard stop via SAW_INSTALL_REQUIRE_STOPPED=1.
+#
+# lock_file MUST match internal/update.HostLockPath in LenderCom/saw-agent
+# (HostLockName = "agent.lock", sited beside the broker socket dir, i.e.
+# $HOME/.saw/agent.lock) — this is a non-blocking probe (flock -n / LOCK_NB)
+# so a stale lock file left behind with no live holder never false-positives.
+check_host_lock() {
+  home_dir="$1"
+  lock_file="$home_dir/.saw/agent.lock"
+  [ -e "$lock_file" ] || return 0
+  held=""
+  if have flock; then
+    if ! flock -n -x "$lock_file" -c true >/dev/null 2>&1; then
+      held=1
+    fi
+  elif have perl; then
+    if ! perl -e '
+      use Fcntl qw(:flock);
+      open(my $fh, "<", $ARGV[0]) or exit 2;
+      exit(flock($fh, LOCK_EX | LOCK_NB) ? 0 : 1);
+    ' "$lock_file" >/dev/null 2>&1; then
+      held=1
+    fi
   else
-    # No sudo here on purpose: under `curl | sh`, sudo's password prompt would
-    # read the pipe and eat the rest of the script.
-    INSTALL_DIR="$HOME/.local/bin"
-    mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
+    say "Note: cannot check for a running saw-agent (need flock or perl) — proceeding."
+    return 0
+  fi
+  if [ -n "$held" ]; then
+    if [ "${SAW_INSTALL_REQUIRE_STOPPED:-0}" = "1" ]; then
+      fail "a saw-agent is currently running on this host (lock held at $lock_file); stop it first or unset SAW_INSTALL_REQUIRE_STOPPED"
+    fi
+    say "Note: a saw-agent is currently running on this host. Installing will replace its binary and restart the service — this interrupts any in-flight agent work (sessions resume via the platform's recovery, but the interruption is real)."
   fi
 }
 
-main() {
-  command -v curl >/dev/null 2>&1 || fail "curl is required"
-  command -v tar >/dev/null 2>&1 || fail "tar is required"
+# --- service unit installation ---
+write_channel_record() {
+  channel_dir="$1/.saw/cloud"
+  mkdir -p "$channel_dir"
+  printf '%s' "$CHANNEL" > "$channel_dir/channel.tmp"
+  mv "$channel_dir/channel.tmp" "$channel_dir/channel"
+}
 
+install_launchd_unit() {
+  home_dir="$1"
+  bin_path="$2"
+  label="com.sawrun.saw-agent"
+  plist_dir="$home_dir/Library/LaunchAgents"
+  plist="$plist_dir/${label}.plist"
+  log_dir="$home_dir/.saw/logs"
+  mkdir -p "$plist_dir" "$log_dir"
+  prior_plist=0
+  [ -f "$plist" ] && prior_plist=1
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- generated by LenderCom/get agent installer, unit template v${INSTALLER_TEMPLATE_VERSION} -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bin_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+    <key>ExitTimeOut</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>${log_dir}/agent.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${log_dir}/agent.err.log</string>
+</dict>
+</plist>
+PLIST
+  if [ "$DRY_RUN" -eq 0 ]; then
+    domain="gui/$(id -u)"
+    if [ "$prior_plist" -eq 1 ]; then
+      # A unit was already loaded — actually tear it down before reloading so
+      # the freshly-installed binary is what comes back up, not the old one
+      # still resident under the previous bootstrap. Prefer the modern
+      # bootout/bootstrap pair; fall back to unload/load for older macOS.
+      launchctl bootout "$domain" "$plist" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+    fi
+    if ! launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1; then
+      launchctl load -w "$plist" || fail "launchctl load failed for $plist"
+    fi
+    if [ "$prior_plist" -eq 1 ]; then
+      # Belt-and-braces: force a restart in case bootout above silently
+      # no-op'd (e.g. the prior process was already gone) and bootstrap
+      # therefore didn't actually replace a live process.
+      launchctl kickstart -k "${domain}/${label}" >/dev/null 2>&1 || true
+    fi
+  fi
+  say "Installed launchd unit: $plist"
+}
+
+install_systemd_unit() {
+  home_dir="$1"
+  bin_path="$2"
+  unit_dir="$home_dir/.config/systemd/user"
+  unit="$unit_dir/saw-agent.service"
+  mkdir -p "$unit_dir"
+  prior_unit=0
+  [ -f "$unit" ] && prior_unit=1
+  cat > "$unit" <<UNIT
+# generated by LenderCom/get agent installer, unit template v${INSTALLER_TEMPLATE_VERSION}
+[Unit]
+Description=SAW standalone agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin_path}
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if have loginctl; then
+      loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || \
+        say "Note: could not enable lingering for $(id -un) — the service may stop when you log out. Ask an admin to run: loginctl enable-linger $(id -un)"
+    fi
+    have systemctl || fail "systemctl not found — cannot register the systemd --user unit"
+    systemctl --user daemon-reload
+    if [ "$prior_unit" -eq 1 ]; then
+      # A unit already existed, so `enable --now` on an already-active service
+      # is a no-op start (systemd never restarts a running unit just because
+      # its file changed) — force a real restart so the freshly-installed
+      # binary actually gets loaded.
+      systemctl --user enable saw-agent.service || fail "systemctl --user enable saw-agent.service failed"
+      systemctl --user restart saw-agent.service || fail "systemctl --user restart saw-agent.service failed"
+    else
+      systemctl --user enable --now saw-agent.service || fail "systemctl --user enable --now saw-agent.service failed"
+    fi
+  fi
+  say "Installed systemd --user unit: $unit"
+}
+
+install_service_unit() {
+  home_dir="$1"
+  bin_path="$2"
+  [ "${SAW_SKIP_SERVICE:-0}" = "1" ] && { say "SAW_SKIP_SERVICE set — not installing a service unit."; return 0; }
+  case "$PLATFORM_OS" in
+    darwin) install_launchd_unit "$home_dir" "$bin_path" ;;
+    linux) install_systemd_unit "$home_dir" "$bin_path" ;;
+  esac
+}
+
+# --- the real install path ---
+do_install() {
   detect_platform
-  asset="saw-agent_${SAW_AGENT_VERSION}_${PLATFORM}.tar.gz"
+  tag="$(release_tag "$CHANNEL")"
+
+  home_dir="${HOME:?HOME must be set}"
+  install_dir="${SAW_INSTALL_DIR:-$home_dir/.saw/bin}"
+  mkdir -p "$install_dir"
 
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/saw-agent-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
 
-  say "Downloading saw-agent ${SAW_AGENT_VERSION} (${PLATFORM})..."
-  curl -fsSL --proto '=https' -o "$tmp/$asset" "$RELEASE_BASE/$asset" ||
-    fail "download failed: $RELEASE_BASE/$asset"
-  curl -fsSL --proto '=https' -o "$tmp/SHA256SUMS" "$RELEASE_BASE/SHA256SUMS" ||
-    fail "download failed: $RELEASE_BASE/SHA256SUMS"
-  verify_checksum "$tmp/$asset" "$tmp/SHA256SUMS"
+  say "Fetching release manifest ($CHANNEL, $tag)..."
+  fetch "$(release_url "$tag" manifest.json)" "$tmp/manifest.json"
+  fetch "$(release_url "$tag" manifest.json.minisig)" "$tmp/manifest.json.minisig"
+  verify_manifest_signature "$tmp/manifest.json" "$tmp/manifest.json.minisig" "$CHANNEL"
+
+  manifest_channel="$(json_scalar "$tmp/manifest.json" channel)"
+  manifest_version="$(json_scalar "$tmp/manifest.json" version)"
+  yanked="$(json_scalar "$tmp/manifest.json" yanked)"
+  [ "$manifest_channel" = "$CHANNEL" ] || fail "manifest channel '$manifest_channel' does not match requested channel '$CHANNEL'"
+  [ "$yanked" = "true" ] && fail "release $manifest_version on channel $CHANNEL has been yanked — refusing to install"
+
+  asset="$(manifest_artifact_field "$tmp/manifest.json" "$PLATFORM_OS" "$PLATFORM_ARCH" name)"
+  [ -n "$asset" ] || fail "no artifact for ${PLATFORM_OS}/${PLATFORM_ARCH} in the manifest for $manifest_version"
+  manifest_sha="$(manifest_artifact_field "$tmp/manifest.json" "$PLATFORM_OS" "$PLATFORM_ARCH" sha256)"
+  [ -n "$manifest_sha" ] || fail "manifest has no sha256 for $asset"
+
+  say "Downloading $asset ($manifest_version)..."
+  fetch "$(release_url "$tag" "$asset")" "$tmp/$asset"
+
+  # Manifest sha256 is the authoritative, signature-covered value. SHA256SUMS
+  # is fetched too and cross-checked only as a tamper-evidence belt-and-
+  # braces: it is NOT itself signed, so a mismatch against it is a hard
+  # failure but a match against it alone (without the manifest match) would
+  # prove nothing.
+  fetch "$(release_url "$tag" SHA256SUMS)" "$tmp/SHA256SUMS" || true
+  actual_sha="$(sha256_of "$tmp/$asset")"
+  [ "$actual_sha" = "$manifest_sha" ] || fail "checksum mismatch for $asset: manifest says $manifest_sha, got $actual_sha"
+  if [ -s "$tmp/SHA256SUMS" ]; then
+    sums_sha="$(grep " $asset\$" "$tmp/SHA256SUMS" | awk '{print $1}')"
+    if [ -n "$sums_sha" ] && [ "$sums_sha" != "$manifest_sha" ]; then
+      fail "SHA256SUMS and the signed manifest disagree on $asset's checksum — refusing to install"
+    fi
+  fi
 
   tar -xzf "$tmp/$asset" -C "$tmp" saw-agent
   [ -f "$tmp/saw-agent" ] || fail "archive did not contain a saw-agent binary"
   chmod 0755 "$tmp/saw-agent"
 
-  pick_install_dir
-  # Copy to a temp name in the target dir, then atomic mv — replacing an
+  check_host_lock "$home_dir"
+
+  # Copy to a temp name in the target dir, then atomic mv -- replacing an
   # in-use binary in place would fail with ETXTBSY on Linux.
-  cp "$tmp/saw-agent" "$INSTALL_DIR/.saw-agent.new" || fail "cannot write to $INSTALL_DIR"
-  mv "$INSTALL_DIR/.saw-agent.new" "$INSTALL_DIR/saw-agent"
+  cp "$tmp/saw-agent" "$install_dir/.saw-agent.new" || fail "cannot write to $install_dir"
+  mv "$install_dir/.saw-agent.new" "$install_dir/saw-agent"
+  say "Installed: $install_dir/saw-agent"
 
-  say "Installed: $INSTALL_DIR/saw-agent"
-  "$INSTALL_DIR/saw-agent" --version || true
+  write_channel_record "$home_dir"
+  install_service_unit "$home_dir" "$install_dir/saw-agent"
 
-  resolved="$(command -v saw-agent 2>/dev/null || true)"
+  "$install_dir/saw-agent" --version || true
+
   case ":$PATH:" in
-    *":$INSTALL_DIR:"*)
-      if [ -n "$resolved" ] && [ "$resolved" != "$INSTALL_DIR/saw-agent" ]; then
-        say "Note: 'saw-agent' currently resolves to $resolved (another install shadows this one)."
-      fi
-      ;;
+    *":$install_dir:"*) ;;
     *)
       say ""
-      say "$INSTALL_DIR is not on your PATH. Add it:"
-      say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+      say "$install_dir is not on your PATH. Add it:"
+      say "  export PATH=\"$install_dir:\$PATH\""
       ;;
   esac
+}
+
+# --- --dry-run: a self-test against a throwaway fixture release, exercising
+# the same functions the real install path uses (manifest parsing, signature
+# verification, checksum verification, unit generation, host-lock check,
+# channel-record write) without touching the network or the real ~/.saw. ---
+run_self_test() {
+  fake_home="$1"
+  mkdir -p "$fake_home"
+  fixture="$fake_home/fixture"
+  mkdir -p "$fixture"
+
+  detect_platform
+  say "self-test: platform ${PLATFORM_OS}/${PLATFORM_ARCH}"
+
+  asset="saw-agent_test_${PLATFORM_OS}_${PLATFORM_ARCH}.tar.gz"
+  payload="$fixture/payload"
+  mkdir -p "$payload"
+  printf '#!/bin/sh\necho "saw-agent 0.0.0-test (commit test)"\n' > "$payload/saw-agent"
+  chmod +x "$payload/saw-agent"
+  (cd "$payload" && tar -czf "$fixture/$asset" saw-agent)
+  asset_sha="$(sha256_of "$fixture/$asset")"
+
+  cat > "$fixture/manifest.json" <<EOF
+{"version":"v0.0.0-test","channel":"$CHANNEL","commit":"test0000","min_version":"v0.0.0","artifacts":[{"os":"$PLATFORM_OS","arch":"$PLATFORM_ARCH","name":"$asset","sha256":"$asset_sha"}],"created_at":"2026-01-01T00:00:00Z","yanked":false}
+EOF
+  printf '%s  %s\n' "$asset_sha" "$asset" > "$fixture/SHA256SUMS"
+
+  if have minisign; then
+    minisign -G -f -p "$fixture/test.pub" -s "$fixture/test.sec" -W < /dev/null >/dev/null 2>&1
+    test_pubkey="$(tail -n1 "$fixture/test.pub")"
+    minisign -Sm "$fixture/manifest.json" -s "$fixture/test.sec" < /dev/null >/dev/null 2>&1
+
+    say "self-test: verifying with the correct key (expect OK)..."
+    ok=1
+    for pk in "$test_pubkey" "$SAW_MINISIGN_PUBKEY_DEV_CURRENT"; do
+      if minisign -Vq -m "$fixture/manifest.json" -x "$fixture/manifest.json.minisig" -P "$pk" >/dev/null 2>&1; then
+        ok=0
+        break
+      fi
+    done
+    [ "$ok" -eq 0 ] || fail "self-test: expected signature verification to succeed with the fixture key"
+    say "self-test: signature verify OK"
+
+    say "self-test: verifying a tampered manifest (expect FAIL)..."
+    cp "$fixture/manifest.json" "$fixture/manifest.tampered.json"
+    sed -i.bak 's/"channel":"'"$CHANNEL"'"/"channel":"tampered"/' "$fixture/manifest.tampered.json"
+    if minisign -Vq -m "$fixture/manifest.tampered.json" -x "$fixture/manifest.json.minisig" -P "$test_pubkey" >/dev/null 2>&1; then
+      fail "self-test: tampered manifest verified successfully — this must never happen"
+    fi
+    say "self-test: tamper correctly rejected"
+  else
+    say "self-test: SKIP signature round-trip (minisign not installed) — parsing/checksum/unit logic below still runs"
+  fi
+
+  manifest_channel="$(json_scalar "$fixture/manifest.json" channel)"
+  [ "$manifest_channel" = "$CHANNEL" ] || fail "self-test: channel parse mismatch: got '$manifest_channel'"
+  yanked="$(json_scalar "$fixture/manifest.json" yanked)"
+  [ "$yanked" = "false" ] || fail "self-test: yanked parse mismatch: got '$yanked'"
+  parsed_asset="$(manifest_artifact_field "$fixture/manifest.json" "$PLATFORM_OS" "$PLATFORM_ARCH" name)"
+  [ "$parsed_asset" = "$asset" ] || fail "self-test: artifact name parse mismatch: got '$parsed_asset' want '$asset'"
+  parsed_sha="$(manifest_artifact_field "$fixture/manifest.json" "$PLATFORM_OS" "$PLATFORM_ARCH" sha256)"
+  [ "$parsed_sha" = "$asset_sha" ] || fail "self-test: artifact sha256 parse mismatch"
+  say "self-test: manifest field parsing OK (both jq and fallback paths, if jq present)"
+  if have jq; then
+    have() { [ "$1" != jq ]; }
+    fallback_asset="$(manifest_artifact_field "$fixture/manifest.json" "$PLATFORM_OS" "$PLATFORM_ARCH" name)"
+    [ "$fallback_asset" = "$asset" ] || fail "self-test: fallback parser mismatch: got '$fallback_asset'"
+    have() { command -v "$1" >/dev/null 2>&1; }
+    say "self-test: fallback (no-jq) parser cross-checked OK"
+  fi
+
+  tar -xzf "$fixture/$asset" -C "$fixture" saw-agent
+  actual_sha="$(sha256_of "$fixture/$asset")"
+  [ "$actual_sha" = "$asset_sha" ] || fail "self-test: checksum self-check failed"
+  say "self-test: checksum verification OK"
+
+  test_host_lock_detection "$fake_home"
+
+  check_host_lock "$fake_home"
+  write_channel_record "$fake_home"
+  [ "$(cat "$fake_home/.saw/cloud/channel")" = "$CHANNEL" ] || fail "self-test: channel record write mismatch"
+  say "self-test: channel record write OK ($fake_home/.saw/cloud/channel = $CHANNEL)"
+
+  install_dir="$fake_home/.saw/bin"
+  mkdir -p "$install_dir"
+  cp "$fixture/saw-agent" "$install_dir/saw-agent"
+  install_service_unit "$fake_home" "$install_dir/saw-agent"
+  case "$PLATFORM_OS" in
+    darwin) [ -f "$fake_home/Library/LaunchAgents/com.sawrun.saw-agent.plist" ] || fail "self-test: launchd plist not written" ;;
+    linux) [ -f "$fake_home/.config/systemd/user/saw-agent.service" ] || fail "self-test: systemd unit not written" ;;
+  esac
+  say "self-test: service unit template generation OK"
+
+  say "self-test: ALL CHECKS PASSED (channel=$CHANNEL)"
+}
+
+test_host_lock_detection() {
+  fake_home="$1"
+  lock_home="$fake_home/locktest"
+  mkdir -p "$lock_home/.saw"
+  lock_path="$lock_home/.saw/agent.lock"
+  : > "$lock_path"
+
+  out="$(check_host_lock "$lock_home" 2>&1)"
+  case "$out" in
+    *"currently running"*) fail "self-test: host-lock reported held before anyone held it" ;;
+  esac
+  say "self-test: host-lock free-case OK (no warning when nothing holds the lock)"
+
+  if ! have perl; then
+    say "self-test: SKIP host-lock held-case (perl not installed)"
+    return 0
+  fi
+  perl -e '
+    use Fcntl qw(:flock);
+    open(my $fh, "<", $ARGV[0]) or exit 1;
+    flock($fh, LOCK_EX) or exit 1;
+    sleep 3;
+  ' "$lock_path" &
+  holder_pid=$!
+  tries=0
+  out=""
+  while [ "$tries" -lt 30 ]; do
+    out="$(check_host_lock "$lock_home" 2>&1)"
+    case "$out" in
+      *"currently running"*) break ;;
+    esac
+    tries=$((tries + 1))
+    sleep 0.1
+  done
+  wait "$holder_pid" 2>/dev/null || true
+  case "$out" in
+    *"currently running"*) say "self-test: host-lock held-case OK (warned while the fixture holder had the lock)" ;;
+    *) fail "self-test: expected a host-lock warning while a holder had the lock" ;;
+  esac
+}
+
+main() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    fake_home="$(mktemp -d "${TMPDIR:-/tmp}/saw-agent-selftest.XXXXXX")"
+    trap 'rm -rf "$fake_home"' EXIT
+    run_self_test "$fake_home"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v tar >/dev/null 2>&1 || fail "tar is required"
+  do_install
 }
 
 main "$@"
