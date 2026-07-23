@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -s sh agent
+
+      - name: install minisign (macOS)
+        if: runner.os == 'macOS'
+        run: brew install minisign
+
+      - name: install minisign (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: scripted install self-test (dev channel)
+        run: ./agent --dry-run --channel dev
+
+      - name: scripted install self-test (stable channel)
+        run: ./agent --dry-run --channel stable
+
+      - name: scripted install self-test under dash (POSIX sh, not bash)
+        if: runner.os == 'Linux'
+        run: dash ./agent --dry-run --channel dev

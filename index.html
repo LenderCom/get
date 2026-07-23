@@ -13,13 +13,15 @@
   <body>
     <h1>LenderCom installers</h1>
     <p><strong>saw-agent</strong> — the SAW remote agent (macOS / Linux, amd64 / arm64):</p>
-    <pre>curl -fsSL https://get.sawrun.com/agent | sh</pre>
+    <pre>curl -fsSL https://get.sawrun.com/agent | sh -s -- --channel stable</pre>
+    <p>Track the dev channel instead with <code>--channel dev</code> (or <code>SAW_CLOUD_CHANNEL=dev</code>). The script installs to <code>~/.saw/bin/saw-agent</code> and registers a launchd/systemd-user unit that keeps it running.</p>
     <p>macOS via Homebrew:</p>
     <pre>brew install lendercom/tap/saw-agent</pre>
     <p>
       Binaries are published as release assets on
-      <a href="https://github.com/LenderCom/homebrew-tap/releases">LenderCom/homebrew-tap</a>;
-      the install script checksum-verifies every download. Script source:
+      <a href="https://github.com/LenderCom/saw-agent-releases">LenderCom/saw-agent-releases</a>;
+      the install script verifies the release manifest's minisign signature
+      before trusting any checksum in it. Script source:
       <a href="https://github.com/LenderCom/get">LenderCom/get</a>.
     </p>
   </body>
