@@ -32,15 +32,15 @@
 
 set -eu
 
-# --- placeholders, replace at T0 (org-admin key provisioning, plan §2.7) ---
-# These are NOT real minisign keys. LenderCom/saw-agent-releases, its signing
-# keypairs, and the release pipeline do not exist yet (tracked as a blocker
-# on this ticket) — until they do, every real install fails closed at
-# signature verification, by design: an installer that "verifies" against a
-# placeholder key would be worse than one that refuses to run.
-SAW_MINISIGN_PUBKEY_DEV_CURRENT="RWTPLACEHOLDERDEVCURRENTKEYDONOTTRUST0000000000000000000000"
+# --- T0 org-admin key provisioning (plan §2.7) landed: real per-channel
+# signing keys are embedded below. Each channel ships with exactly one
+# keypair today (CURRENT) — STANDBY stays a placeholder, never matched by
+# channel_pubkeys() in practice, until the first key rotation mints a real
+# second keypair per channel (plan §2.7's key SET). Until that rotation, a
+# lost/compromised CURRENT key has no fallback but a re-provisioned release.
+SAW_MINISIGN_PUBKEY_DEV_CURRENT="RWRkvU4wu6xpGY/85Ju6BR/s1dFInc2tMxQbw0BU4svS9H/SXobkcCkN"
 SAW_MINISIGN_PUBKEY_DEV_STANDBY="RWTPLACEHOLDERDEVSTANDBYKEYDONOTTRUST0000000000000000000000"
-SAW_MINISIGN_PUBKEY_STABLE_CURRENT="RWTPLACEHOLDERSTABLECURRENTKEYDONOTTRUST000000000000000000"
+SAW_MINISIGN_PUBKEY_STABLE_CURRENT="RWRrqNvfbutHLYDzLjsQAMH0cToq9RxT+kS3SFYkEcgkR9dJcz5rVSkO"
 SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST000000000000000000"
 
 # Pinned release tags per channel (plan §2.1: dev tags are metadata-stripped
