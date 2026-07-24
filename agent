@@ -47,7 +47,7 @@ SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST0000
 # prereleases like `dev-v0.2.0-dev.31`; stable tags are plain `vX.Y.Z`).
 # Bumped by the automated formula/get-bump wiring (plan §2.7/2.11 Phase 1);
 # until that lands and the releases repo exists, these are placeholders.
-SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.1-dev.21}"
+SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.2-dev.53}"
 SAW_AGENT_TAG_STABLE="${SAW_AGENT_TAG_STABLE:-v0.1.0}"
 
 RELEASES_REPO="LenderCom/saw-agent-releases"
