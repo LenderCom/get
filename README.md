@@ -39,7 +39,10 @@ script refuses to install without it rather than skip signature verification.
 
 Overrides (environment variables): `SAW_INSTALL_DIR`, `SAW_SKIP_SERVICE=1`,
 `SAW_AGENT_TAG_DEV=<tag>` / `SAW_AGENT_TAG_STABLE=<tag>` (pin an exact
-release tag instead of the script's built-in default).
+release tag instead of resolving the channel's current one).
+
+Run `./agent --resolve-only [--channel dev|stable]` to print the release tag an
+install would use right now, without downloading or installing anything.
 
 Run `./agent --dry-run [--channel dev|stable]` to self-test the install logic
 (manifest parsing, signature verification round-trip, checksum verification,
@@ -56,21 +59,29 @@ macOS's quarantine attribute on the extracted binary; use the script or brew, or
 saw-agent releases are published to
 [LenderCom/saw-agent-releases](https://github.com/LenderCom/saw-agent-releases)
 (dev channel: prerelease tags off `main`; stable channel: `v*` tags) — see
-`plan/saw-agent-auto-update-plan.md` §2.7 in `LenderCom/saw-docs`. The pinned
-tag constants in [`agent`](agent) (`SAW_AGENT_TAG_DEV` / `SAW_AGENT_TAG_STABLE`)
-used to only be bumped by hand alongside a release; [`bump-dev-tag.yml`](.github/workflows/bump-dev-tag.yml)
-now keeps `SAW_AGENT_TAG_DEV` current automatically (`script/bump-dev-tag.sh`, polling
-`saw-agent-releases` on a schedule until that repo dispatches this one directly).
+`plan/saw-agent-auto-update-plan.md` §2.7 in `LenderCom/saw-docs`.
 
-**`SAW_AGENT_TAG_STABLE` has no equivalent yet and is currently BROKEN** — its default
-(`v0.1.0`) does not exist on `saw-agent-releases` (no stable tag has been published there;
-the real `v0.1.0` binaries live on `LenderCom/homebrew-tap`'s own release, a different
-repo/tag), so `curl -fsSL https://get.sawrun.com/agent | sh` (channel defaults to `stable`)
-404s on a real install today. Fixing it needs either an initial stable tag cut on
-`saw-agent-releases` (with the real minisign stable-channel signing key this repo doesn't
-have — public key only, by design), or a decision to repoint the stable fetch at
-`homebrew-tap`'s release until one exists. Flagged, not fixed, in the PR that added
-`bump-dev-tag.yml` — this needs an org/release-process call, not a script change.
+[`agent`](agent) does not install a hardcoded release. It resolves the channel's
+current tag at install time from `saw-agent-releases`' public
+[releases Atom feed](https://github.com/LenderCom/saw-agent-releases/releases.atom),
+taking the newest entry whose tag matches the channel's shape (`dev-vX.Y.Z-dev.N` /
+`vX.Y.Z`). The Atom feed rather than `api.github.com` because it is publish-time
+ordered and carries no anonymous rate limit: every dev release on that repo shares one
+`created_at`, so the created_at-ordered REST `/releases` list returns an arbitrary one
+of them (it named `dev-v0.1.2-dev.97` while `dev-v0.1.2-dev.100` was live).
+
+Resolution only chooses which release to fetch. Trust is unchanged and still decided
+after the fetch: the manifest's minisign signature against the embedded per-channel
+public key, the manifest's own `channel` field, its `yanked` flag, and the per-artifact
+sha256.
+
+The `SAW_AGENT_TAG_*_FALLBACK` constants in `agent` are used only when the feed is
+unreachable (air-gapped/proxied installs), and the installer says so out loud when it
+falls back. They still have to point at a release that EXISTS — the dev channel prunes
+old prereleases — so [`bump-dev-tag.yml`](.github/workflows/bump-dev-tag.yml) keeps both
+current (`script/bump-fallback-tag.sh`, polling `saw-agent-releases` on a schedule until
+that repo dispatches this one directly), and CI fails if either fallback's release has
+gone away.
 
 ## Branded domain
 

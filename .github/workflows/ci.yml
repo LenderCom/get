@@ -44,3 +44,34 @@ jobs:
       - name: scripted install self-test under dash (POSIX sh, not bash)
         if: runner.os == 'Linux'
         run: dash ./agent --dry-run --channel dev
+
+      # The self-tests above fabricate their own fixture release, so they pass happily
+      # while the real thing 404s. These steps hit the live releases repo: they are what
+      # catches a broken resolver, and a fallback tag whose release no longer exists.
+      - name: resolve the live release tag for each channel
+        run: |
+          set -eu
+          for channel in dev stable; do
+            tag="$(./agent --resolve-only --channel "$channel")"
+            echo "$channel -> $tag"
+            case "$channel:$tag" in
+              dev:dev-v*) ;;
+              stable:v*) ;;
+              *) echo "::error::resolved an implausible $channel tag: '$tag'"; exit 1 ;;
+            esac
+            curl -fsSLI -o /dev/null \
+              "https://github.com/LenderCom/saw-agent-releases/releases/download/$tag/manifest.json" \
+              || { echo "::error::resolved $channel tag $tag has no manifest.json"; exit 1; }
+          done
+
+      - name: built-in fallback tags still point at a release that exists
+        run: |
+          set -eu
+          for var in SAW_AGENT_TAG_DEV_FALLBACK SAW_AGENT_TAG_STABLE_FALLBACK; do
+            tag="$(sed -n "s/^${var}=\"\(.*\)\"\$/\1/p" agent)"
+            [ -n "$tag" ] || { echo "::error::could not read $var out of ./agent"; exit 1; }
+            echo "$var -> $tag"
+            curl -fsSLI -o /dev/null \
+              "https://github.com/LenderCom/saw-agent-releases/releases/download/$tag/manifest.json" \
+              || { echo "::error::$var=$tag no longer exists — run script/bump-fallback-tag.sh"; exit 1; }
+          done
