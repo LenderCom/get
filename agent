@@ -20,10 +20,13 @@
 #   --dry-run              run the full install flow against a throwaway,
 #                          self-signed fixture instead of the real network
 #                          and system paths — a self-test, not a real install
+#   --resolve-only         print the release tag this installer would install
+#                          for the channel, then exit (no download, no install)
 #
 # Environment variables:
 #   SAW_CLOUD_CHANNEL   same as --channel; --channel wins if both are given
-#   SAW_AGENT_TAG_DEV / SAW_AGENT_TAG_STABLE   override the pinned release tag
+#   SAW_AGENT_TAG_DEV / SAW_AGENT_TAG_STABLE   pin an exact release tag instead
+#                       of resolving the channel's current one
 #   SAW_INSTALL_DIR     override ~/.saw/bin
 #   SAW_SKIP_SERVICE    set to skip installing the launchd/systemd unit
 #
@@ -43,12 +46,13 @@ SAW_MINISIGN_PUBKEY_DEV_STANDBY="RWTPLACEHOLDERDEVSTANDBYKEYDONOTTRUST0000000000
 SAW_MINISIGN_PUBKEY_STABLE_CURRENT="RWRrqNvfbutHLYDzLjsQAMH0cToq9RxT+kS3SFYkEcgkR9dJcz5rVSkO"
 SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST000000000000000000"
 
-# Pinned release tags per channel (plan §2.1: dev tags are metadata-stripped
-# prereleases like `dev-v0.2.0-dev.31`; stable tags are plain `vX.Y.Z`).
-# Bumped by the automated formula/get-bump wiring (plan §2.7/2.11 Phase 1);
-# until that lands and the releases repo exists, these are placeholders.
-SAW_AGENT_TAG_DEV="${SAW_AGENT_TAG_DEV:-dev-v0.1.1-dev.21}"
-SAW_AGENT_TAG_STABLE="${SAW_AGENT_TAG_STABLE:-v0.1.0}"
+# Last-resort fallback tags per channel (plan §2.1: dev tags are metadata-stripped
+# prereleases like `dev-v0.2.0-dev.31`; stable tags are plain `vX.Y.Z`). These are
+# used ONLY when the releases feed is unreachable — see release_tag below for why
+# a hardcoded pin cannot be the primary source. Kept current by
+# script/bump-fallback-tag.sh + .github/workflows/bump-dev-tag.yml.
+SAW_AGENT_TAG_DEV_FALLBACK="dev-v0.1.2-dev.100"
+SAW_AGENT_TAG_STABLE_FALLBACK="v0.1.2"
 
 RELEASES_REPO="LenderCom/saw-agent-releases"
 RELEASES_HOST="https://github.com"
@@ -61,13 +65,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
   cat <<'EOF'
-Usage: agent [--channel dev|stable] [--dry-run]
+Usage: agent [--channel dev|stable] [--dry-run] [--resolve-only]
 EOF
 }
 
 # --- args / channel resolution: --channel > SAW_CLOUD_CHANNEL > stable ---
 CHANNEL="${SAW_CLOUD_CHANNEL:-stable}"
 DRY_RUN=0
+RESOLVE_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --channel)
@@ -81,6 +86,10 @@ while [ $# -gt 0 ]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --resolve-only)
+      RESOLVE_ONLY=1
       shift
       ;;
     -h | --help)
@@ -211,11 +220,76 @@ fetch() {
   curl -fsSL --proto '=https' -o "$out" "$url" || fail "download failed: $url"
 }
 
-release_tag() {
+# --- release tag resolution ---
+# A hardcoded per-channel tag is stale the moment the next release lands, and on
+# the dev channel it is worse than stale: old prereleases are pruned, so an aged
+# pin 404s the whole install rather than merely installing something old. So the
+# tag is RESOLVED at install time from the releases repo's public Atom feed.
+#
+# The feed — not api.github.com — because it is the only unauthenticated endpoint
+# that answers "newest" correctly here. Every dev release on this repo shares one
+# created_at (they are all cut against the same tag object date), and the REST
+# /releases list is created_at-ordered, so it hands back an arbitrary one of them:
+# it returned dev-v0.1.2-dev.97 while dev-v0.1.2-dev.100 was the live build. The
+# Atom feed is publish-time ordered. It also carries no 60-req/hour anonymous
+# rate limit, which a shared corporate NAT would otherwise hit.
+#
+# Resolution only picks WHICH release to fetch. Everything that decides what may
+# be installed is unchanged and still applies to whatever it picks: the manifest's
+# minisign signature against the embedded per-channel key, the manifest's own
+# channel field, the yanked flag, and the per-artifact sha256. A hostile or broken
+# feed can at worst name a different genuinely-signed release of this channel.
+RELEASES_FEED_URL="$RELEASES_HOST/$RELEASES_REPO/releases.atom"
+
+# Tag shapes per channel (plan §2.1). Anchored so a stray tag on the repo can
+# never be mistaken for a release of this channel — note `v*` must NOT match a
+# `dev-v*` prerelease.
+channel_tag_pattern() {
   case "$1" in
-    dev) printf '%s' "$SAW_AGENT_TAG_DEV" ;;
-    stable) printf '%s' "$SAW_AGENT_TAG_STABLE" ;;
+    dev) printf '^dev-v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$' ;;
+    stable) printf '^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
   esac
+}
+
+fallback_tag() {
+  case "$1" in
+    dev) printf '%s' "$SAW_AGENT_TAG_DEV_FALLBACK" ;;
+    stable) printf '%s' "$SAW_AGENT_TAG_STABLE_FALLBACK" ;;
+  esac
+}
+
+# Each feed entry's <id> is `tag:github.com,2008:Repository/<repo-id>/<release-tag>`,
+# newest first; the feed's own top-level <id> has no `Repository/<n>/` segment, so it
+# never matches. Drafts are not published to the feed.
+resolve_from_feed() {
+  channel="$1"
+  feed="$(curl -fsSL --proto '=https' --max-time 20 "$RELEASES_FEED_URL" 2>/dev/null)" || return 1
+  [ -n "$feed" ] || return 1
+  printf '%s\n' "$feed" \
+    | tr '<' '\n' \
+    | sed -n 's|^id>tag:github.com,2008:Repository/[0-9][0-9]*/\(.*\)$|\1|p' \
+    | grep -E "$(channel_tag_pattern "$channel")" \
+    | head -n1
+}
+
+release_tag() {
+  channel="$1"
+  pinned=""
+  case "$channel" in
+    dev) pinned="${SAW_AGENT_TAG_DEV:-}" ;;
+    stable) pinned="${SAW_AGENT_TAG_STABLE:-}" ;;
+  esac
+  if [ -n "$pinned" ]; then
+    printf '%s' "$pinned"
+    return 0
+  fi
+  resolved="$(resolve_from_feed "$channel" || true)"
+  if [ -n "$resolved" ]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  say "Warning: could not resolve the current $channel release from $RELEASES_FEED_URL — falling back to the built-in pin $(fallback_tag "$channel"), which may be out of date." >&2
+  printf '%s' "$(fallback_tag "$channel")"
 }
 
 release_url() {
@@ -449,6 +523,7 @@ print_pairing_next_steps() {
 # --- the real install path ---
 do_install() {
   detect_platform
+  say "Resolving the current $CHANNEL release..."
   tag="$(release_tag "$CHANNEL")"
 
   home_dir="${HOME:?HOME must be set}"
@@ -658,6 +733,12 @@ test_host_lock_detection() {
 }
 
 main() {
+  if [ "$RESOLVE_ONLY" -eq 1 ]; then
+    command -v curl >/dev/null 2>&1 || fail "curl is required"
+    printf '%s\n' "$(release_tag "$CHANNEL")"
+    return 0
+  fi
+
   if [ "$DRY_RUN" -eq 1 ]; then
     fake_home="$(mktemp -d "${TMPDIR:-/tmp}/saw-agent-selftest.XXXXXX")"
     trap 'rm -rf "$fake_home"' EXIT
