@@ -51,7 +51,7 @@ SAW_MINISIGN_PUBKEY_STABLE_STANDBY="RWTPLACEHOLDERSTABLESTANDBYKEYDONOTTRUST0000
 # used ONLY when the releases feed is unreachable — see release_tag below for why
 # a hardcoded pin cannot be the primary source. Kept current by
 # script/bump-fallback-tag.sh + .github/workflows/bump-dev-tag.yml.
-SAW_AGENT_TAG_DEV_FALLBACK="dev-v0.1.2-dev.100"
+SAW_AGENT_TAG_DEV_FALLBACK="dev-v0.1.3-dev.945"
 SAW_AGENT_TAG_STABLE_FALLBACK="v0.1.2"
 
 RELEASES_REPO="LenderCom/saw-agent-releases"
